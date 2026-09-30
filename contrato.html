@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Contrato de mfe-seguimiento (sin contenedor)</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background: #fafafa; }
+    #resumen { font-weight: bold; padding: 8px 12px; background: #fff3c4; }
+    #resumen[data-estado="ok"] { background: #eaf6ea; color: #1b7a3e; }
+    #resumen[data-estado="fallo"] { background: #fdecea; color: #a12a1e; }
+    li.ok { color: #1b7a3e; }
+    li.mal { color: #a12a1e; font-weight: bold; }
+    #raiz-prueba { border: 1px dashed #bbb; padding: 8px; margin-top: 16px; }
+  </style>
+  <link rel="stylesheet" href="http://localhost:8085/tokens.css">
+</head>
+<body>
+  <h1>Pruebas de contrato: mfe-seguimiento</h1>
+  <p>Verifican, sin el contenedor, el contrato de montaje y los eventos acordados en <code>contenedor/CONTRATOS.md</code>.</p>
+  <p id="resumen">Ejecutando…</p>
+  <ul id="resultados"></ul>
+  <div id="raiz-prueba"></div>
+
+  <script src="seguimiento.js" data-intervalo-ms="150"></script>
+  <script>
+    (async function () {
+      const lista = document.getElementById('resultados');
+      const resumen = document.getElementById('resumen');
+      const raiz = document.getElementById('raiz-prueba');
+      let total = 0, fallos = 0;
+
+      function verificar(descripcion, condicion, detalle) {
+        total++;
+        console.assert(condicion, descripcion, detalle === undefined ? '' : detalle);
+        if (!condicion) fallos++;
+        const li = document.createElement('li');
+        li.className = condicion ? 'ok' : 'mal';
+        li.textContent = (condicion ? '✓ ' : '✗ ') + descripcion +
+          (!condicion && detalle !== undefined ? ' — recibido: ' + JSON.stringify(detalle) : '');
+        lista.appendChild(li);
+      }
+      const dormir = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+      async function esperar(condicion, ms) {
+        const fin = Date.now() + (ms || 3000);
+        while (Date.now() < fin) { if (condicion()) return true; await dormir(25); }
+        return !!condicion();
+      }
+      // Registra los eventos que publica el MFE bajo prueba
+      function escuchar(nombre) {
+        const recibidos = [];
+        window.addEventListener(nombre, function (e) { recibidos.push(e.detail); });
+        return recibidos;
+      }
+      const claves = function (o) { return Object.keys(o).sort().join(','); };
+
+      try {
+        // ---- Contrato de montaje
+        verificar('Expone window.renderSeguimiento', typeof window.renderSeguimiento === 'function');
+        verificar('Expone window.unmountSeguimiento', typeof window.unmountSeguimiento === 'function');
+        const estados = escuchar('pedido:estado');
+        window.renderSeguimiento('raiz-prueba');
+        const monto = await esperar(function () { return raiz.querySelector('.seg-titulo'); }, 6000);
+        verificar('El montaje genera contenido (Vue cargado desde el CDN)', !!monto && raiz.children.length > 0);
+        verificar('Sin pedidos, muestra el mensaje de lista vacía', !!raiz.querySelector('.seg-vacio'));
+
+        // ---- pedido:confirmado (v1) -> pedido:estado
+        const detalleV1 = function (id) {
+          return { version: 1, id: id, total: 12500, fecha: new Date().toISOString(),
+                   items: [{ id: 1, nombre: 'Plato A', precio: 10000, cantidad: 1 }, { id: 2, nombre: 'Plato B', precio: 2500, cantidad: 1 }] };
+        };
+        window.dispatchEvent(new CustomEvent('pedido:confirmado', { detail: detalleV1(9001) }));
+        await esperar(function () { return estados.some(function (e) { return e.id === 9001; }); });
+        const primero = estados.find(function (e) { return e.id === 9001; });
+        verificar('Reacciona a pedido:confirmado publicando pedido:estado', !!primero);
+        verificar('pedido:estado tiene la estructura acordada { version, id, estado, anterior }',
+          !!primero && claves(primero) === 'anterior,estado,id,version' && primero.version === 1 &&
+          typeof primero.estado === 'string', primero);
+        verificar('El primer estado es "Recibido" con anterior null', !!primero && primero.estado === 'Recibido' && primero.anterior === null, primero);
+        verificar('La vista muestra "Pedido #9001"', raiz.textContent.includes('Pedido #9001'));
+
+        const llego = await esperar(function () {
+          return estados.some(function (e) { return e.id === 9001 && e.estado === 'Entregado'; });
+        }, 4000);
+        const propios = estados.filter(function (e) { return e.id === 9001; });
+        const secuencia = propios.map(function (e) { return e.estado; });
+        verificar('Los estados avanzan solos: Recibido → En preparación → En camino → Entregado',
+          llego && secuencia.join('>') === 'Recibido>En preparación>En camino>Entregado', secuencia);
+        verificar('Cada pedido:estado trae como "anterior" el estado previo', propios.every(function (e, i) {
+          return i === 0 ? e.anterior === null : e.anterior === propios[i - 1].estado;
+        }));
+        await esperar(function () { return raiz.querySelector('.seg-actual') && raiz.querySelector('.seg-actual').textContent === 'Entregado'; });
+        verificar('La vista resalta "Entregado" como estado actual', !!raiz.querySelector('.seg-actual') && raiz.querySelector('.seg-actual').textContent === 'Entregado');
+        const cantidadFinal = estados.filter(function (e) { return e.id === 9001; }).length;
+        await dormir(500);
+        verificar('Al llegar a Entregado el temporizador se detiene (no hay más eventos)',
+          estados.filter(function (e) { return e.id === 9001; }).length === cantidadFinal);
+
+        // ---- Compatibilidad hacia atrás (regla de evolución de CONTRATOS.md)
+        window.dispatchEvent(new CustomEvent('pedido:confirmado', { detail: detalleV1(9002) }));   // v1 antiguo, sin "canal"
+        const conCanal = detalleV1(9003);
+        conCanal.canal = 'web';
+        window.dispatchEvent(new CustomEvent('pedido:confirmado', { detail: conCanal }));           // v1 con el campo opcional nuevo
+        await esperar(function () {
+          return estados.some(function (e) { return e.id === 9002; }) && estados.some(function (e) { return e.id === 9003; });
+        });
+        verificar('Compatibilidad: acepta pedido:confirmado v1 SIN el campo opcional "canal"',
+          estados.some(function (e) { return e.id === 9002 && e.estado === 'Recibido'; }));
+        verificar('Compatibilidad: acepta pedido:confirmado v1 CON el campo opcional "canal"',
+          estados.some(function (e) { return e.id === 9003 && e.estado === 'Recibido'; }));
+        await esperar(function () { return raiz.textContent.includes('#9003'); });
+        const tarjetas = Array.from(raiz.querySelectorAll('.seg-pedido'));
+        const tarjeta2 = tarjetas.find(function (t) { return t.textContent.includes('#9002'); });
+        const tarjeta3 = tarjetas.find(function (t) { return t.textContent.includes('#9003'); });
+        verificar('El pedido sin "canal" se muestra sin canal', !!tarjeta2 && !tarjeta2.textContent.includes('canal'));
+        verificar('El pedido con "canal" lo muestra', !!tarjeta3 && tarjeta3.textContent.includes('canal: web'));
+        const antesV2 = estados.length;
+        window.dispatchEvent(new CustomEvent('pedido:confirmado', { detail: Object.assign(detalleV1(9004), { version: 2 }) }));
+        await dormir(400);
+        verificar('Un evento de versión desconocida (2) se ignora',
+          !estados.some(function (e) { return e.id === 9004; }) && estados.slice(antesV2).every(function (e) { return e.id !== 9004; }));
+
+        // ---- Desmontaje y estado a nivel de módulo
+        window.unmountSeguimiento('raiz-prueba');
+        verificar('unmountSeguimiento deja el contenedor vacío', raiz.innerHTML === '');
+        window.dispatchEvent(new CustomEvent('pedido:confirmado', { detail: detalleV1(9005) }));
+        const avanza = await esperar(function () {
+          return estados.some(function (e) { return e.id === 9005 && e.estado === 'En preparación'; });
+        }, 3000);
+        verificar('Fuera de pantalla sigue recibiendo pedidos y avanzando sus estados', avanza);
+        window.renderSeguimiento('raiz-prueba');
+        await esperar(function () { return raiz.textContent.includes('Pedido #9005'); }, 6000);
+        verificar('Volver a montar solo pinta el estado actual (pedido #9005 presente)', raiz.textContent.includes('Pedido #9005'));
+        window.unmountSeguimiento('raiz-prueba');
+      } catch (err) {
+        verificar('La suite terminó sin excepciones', false, String(err && err.message || err));
+      }
+      resumen.textContent = fallos === 0
+        ? '✓ Todas las pruebas de contrato pasan (' + total + ')'
+        : '✗ Fallan ' + fallos + ' de ' + total + ' pruebas de contrato';
+      resumen.dataset.estado = fallos === 0 ? 'ok' : 'fallo';
+    })();
+  </script>
+</body>
+</html>
